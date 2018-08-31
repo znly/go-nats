@@ -1425,7 +1425,13 @@ func TestDefaultOptionsDialer(t *testing.T) {
 	}
 }
 
+const defaultAddr = "localhost:4222"
+
 func TestCustomFlusherTimeout(t *testing.T) {
+	if testing.Short() {
+		t.Skip("slow test skipped in short mode")
+	}
+
 	s := RunDefaultServer()
 	defer s.Shutdown()
 
@@ -1465,11 +1471,19 @@ func TestCustomFlusherTimeout(t *testing.T) {
 	}()
 	defer nc1.Close()
 
+	delays := make(chan time.Duration)
+
+	proxy, err := newProxy(t, defaultAddr, passthough, block(delays))
+	if err != nil {
+		t.Fatalf("failed to setup proxy: %v", err)
+	}
+	defer proxy.Close()
+
 	opts = &nats.Options{
-		Servers: []string{nats.DefaultURL},
+		Servers: []string{fmt.Sprintf("nats://%s/", proxy.Addr())},
 
 		// Use short flusher timeout to trigger the error
-		FlusherTimeout: 1 * time.Microsecond,
+		FlusherTimeout: 500 * time.Millisecond,
 
 		// Upon failure to be able to exercice ping pong interval
 		// then we will hit this timeout and disconnect
@@ -1493,6 +1507,11 @@ func TestCustomFlusherTimeout(t *testing.T) {
 		t.Fatalf("Expected to be able to create subscription, got: %s", err)
 	}
 
+	go func() {
+		time.Sleep(150 * time.Millisecond)
+		delays <- 2 * time.Second
+	}()
+
 	for {
 		select {
 		case <-time.After(100 * time.Millisecond):
@@ -1506,6 +1525,84 @@ func TestCustomFlusherTimeout(t *testing.T) {
 			t.Errorf("Timeout publishing messages")
 			return
 		}
+	}
+}
+
+type sockBufDialer struct {
+	readSize  int
+	writeSize int
+}
+
+func (cd *sockBufDialer) Dial(network, address string) (net.Conn, error) {
+	c, err := net.Dial(network, address)
+	if err != nil {
+		return nil, err
+	}
+	c.(*net.TCPConn).SetReadBuffer(cd.readSize)
+	c.(*net.TCPConn).SetWriteBuffer(cd.writeSize)
+	return c, nil
+}
+
+func TestTimeoutFlushBuffer(t *testing.T) {
+	s := RunDefaultServer()
+	defer s.Shutdown()
+
+	delays := make(chan time.Duration)
+	proxy, err := newProxy(t, defaultAddr, passthough, block(delays))
+	if err != nil {
+		t.Fatalf("failed to setup proxy: %v", err)
+	}
+	defer proxy.Close()
+
+	doneCh := make(chan struct{})
+	defer close(doneCh)
+
+	opts := &nats.Options{
+		Servers:          []string{fmt.Sprintf("nats://%s/", proxy.Addr())},
+		ReconnectBufSize: -1,
+		CustomDialer:     &sockBufDialer{readSize: 1024, writeSize: 1024},
+		FlusherTimeout:   500 * time.Millisecond,
+	}
+
+	nc, err := opts.Connect()
+	if err != nil {
+		t.Fatalf("Expected to be able to connect, got: %s", err)
+	}
+	defer nc.Close()
+
+	// default write buffer is 32k
+	payload := make([]byte, 128*1024)
+	go func() {
+		for {
+			select {
+			case delays <- 10 * time.Second:
+			case <-doneCh:
+				return
+			}
+		}
+	}()
+
+	timeout := time.After(10 * time.Second)
+
+	for err == nil {
+		select {
+		case <-timeout:
+			t.Fatal("publish should have error by then")
+		case <-time.After(100 * time.Millisecond):
+		}
+		err = nc.Publish("hello", payload)
+	}
+
+	ope, ok := err.(*net.OpError)
+	if !ok {
+		t.Fatal("expected a net.Error")
+	}
+
+	if !ope.Timeout() {
+		t.Error("expected a timeout")
+	}
+	if ope.Op != "write" {
+		t.Error("expected a write error")
 	}
 }
 

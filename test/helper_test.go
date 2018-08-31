@@ -16,8 +16,11 @@ package test
 import (
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"runtime"
 	"strings"
+	"testing"
 	"time"
 
 	"github.com/nats-io/gnatsd/server"
@@ -120,4 +123,113 @@ func RunServerWithOptions(opts server.Options) *server.Server {
 // RunServerWithConfig will run a server with the given configuration file.
 func RunServerWithConfig(configFile string) (*server.Server, *server.Options) {
 	return gnatsd.RunServerWithConfig(configFile)
+}
+
+type wintercept func(io.WriteCloser) io.Writer
+
+func passthough(w io.WriteCloser) io.Writer {
+	return w
+}
+
+func block(ch <-chan time.Duration) wintercept {
+	return func(w io.WriteCloser) io.Writer {
+		return &blocker{ch: ch, w: w}
+	}
+}
+
+type blocker struct {
+	ch <-chan time.Duration
+	w  io.Writer
+}
+
+func (b *blocker) Write(p []byte) (int, error) {
+	select {
+	case d, ok := <-b.ch:
+		if !ok {
+			return 0, io.ErrClosedPipe
+		}
+		time.Sleep(d)
+	default:
+	}
+	return b.w.Write(p)
+}
+
+type proxy struct {
+	t    *testing.T
+	ln   net.Listener
+	up   string
+	quit chan struct{}
+	dw   wintercept
+	uw   wintercept
+}
+
+func newProxy(t *testing.T, targetAddr string, dw, uw wintercept) (*proxy, error) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		return nil, err
+	}
+	p := &proxy{
+		t:    t,
+		up:   targetAddr,
+		ln:   ln,
+		dw:   dw,
+		uw:   uw,
+		quit: make(chan struct{}),
+	}
+
+	go p.acceptLoop()
+
+	return p, nil
+}
+
+func (p *proxy) Addr() net.Addr {
+	return p.ln.Addr()
+}
+
+func (p *proxy) copy(down, up net.Conn) {
+	done := make(chan struct{}, 1)
+	go func() {
+		io.Copy(p.dw(down), up)
+		select {
+		case done <- struct{}{}:
+		default:
+		}
+	}()
+	go func() {
+		io.Copy(p.uw(up), down)
+		select {
+		case done <- struct{}{}:
+		default:
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-p.quit:
+	}
+	up.Close()
+	down.Close()
+}
+
+func (p *proxy) acceptLoop() {
+	for {
+		down, err := p.ln.Accept()
+		if err != nil {
+			return
+		}
+
+		down.(*net.TCPConn).SetReadBuffer(1024)
+
+		up, err := net.DialTimeout("tcp", p.up, 2*time.Second)
+		if err != nil {
+			p.t.Fatal(err)
+		}
+		go p.copy(down, up)
+	}
+}
+
+func (p *proxy) Close() error {
+	err := p.ln.Close()
+	close(p.quit)
+	return err
 }
